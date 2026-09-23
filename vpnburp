@@ -1,0 +1,193 @@
+#!/bin/bash
+# Management for the OpenVPN -> Burp lab, used to intercept mobile apps that
+# ignore the system proxy. Replaces the usual intermediate Kali VM.
+# Based on https://blog.nviso.eu/2020/06/12/intercepting-flutter-traffic-on-ios/
+set -euo pipefail
+cd "$(dirname "$(readlink -f "$0")")"
+
+C_OK=$'\033[1;32m'; C_ER=$'\033[1;31m'; C_IN=$'\033[1;36m'; C_WA=$'\033[1;33m'; C_0=$'\033[0m'
+ok()   { echo "${C_OK}  ok${C_0}   $*"; }
+bad()  { echo "${C_ER}  FAIL${C_0} $*"; }
+warn() { echo "${C_WA}  warn${C_0} $*"; }
+info() { echo "${C_IN}==>${C_0} $*"; }
+
+DK=(docker)
+docker info >/dev/null 2>&1 || DK=(sudo docker)
+DC=("${DK[@]}" compose)
+
+state()    { "${DK[@]}" inspect -f '{{.State.Status}}' ovpn-burp 2>/dev/null || echo absent; }
+restarts() { "${DK[@]}" inspect -f '{{.RestartCount}}' ovpn-burp 2>/dev/null || echo 0; }
+has_tun0() { "${DC[@]}" exec -T ovpn-burp ip link show tun0 >/dev/null 2>&1; }
+
+[[ -f .env ]] || cp .env.example .env
+set -a; . ./.env; set +a
+: "${VPN_PORT:=1194}" "${VPN_PROTO:=udp}" "${BURP_PORT:=8080}" "${CLIENT_NAME:=iphone}"
+GW=172.28.0.1                     # bridge gateway = the host, as seen from the container
+BURP_TARGET="${BURP_HOST:-$GW}"
+
+lan_ip() { ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}'; }
+
+sync_remote_host() {
+    local ip; ip="$(lan_ip)"
+    [[ -n "$ip" ]] || { warn "no LAN IP detected; using REMOTE_HOST=${REMOTE_HOST:-?} from .env"; return; }
+    if [[ "${REMOTE_HOST:-}" != "$ip" ]]; then
+        sed -i -E "s|^REMOTE_HOST=.*|REMOTE_HOST=$ip|" .env
+        info "REMOTE_HOST updated to $ip"
+    fi
+    REMOTE_HOST="$ip"
+}
+
+cmd_up() {
+    sync_remote_host
+    "${DC[@]}" up -d --build
+    info "waiting for OpenVPN to bring up tun0 (max 45s)"
+    local i
+    for i in $(seq 1 45); do
+        has_tun0 && { ok "tun0 up after ${i}s"; break; }
+        [[ "$(state)" == running ]] || break      # it died: stop waiting
+        sleep 1
+    done
+    if ! has_tun0; then
+        echo
+        bad "OpenVPN did not bring up tun0 (state=$(state), restarts=$(restarts)). Latest logs:"
+        echo; "${DC[@]}" logs --tail=40 ovpn-burp; echo
+        bad "fix the above and run ./vpnburp up again"
+        return 1
+    fi
+    echo
+    cmd_check
+    echo
+    info "profile for the device: $PWD/data/clients/$CLIENT_NAME.ovpn"
+    info "to serve it over HTTP:  ./vpnburp serve"
+}
+
+cmd_down()   { "${DC[@]}" down; }
+cmd_logs()   { "${DC[@]}" logs -f --tail=80 ovpn-burp; }
+cmd_rules()  { "${DC[@]}" exec ovpn-burp iptables -t nat -S; "${DC[@]}" exec ovpn-burp iptables -S FORWARD; }
+cmd_shell()  { "${DC[@]}" exec ovpn-burp bash; }
+
+cmd_client() {
+    local name="${1:?usage: ./vpnburp client <name>}"
+    sync_remote_host
+    "${DC[@]}" exec -e REMOTE_HOST="$REMOTE_HOST" ovpn-burp /usr/local/bin/entrypoint.sh client "$name"
+}
+
+cmd_status() {
+    "${DC[@]}" ps
+    echo
+    if [[ -f data/status.log ]]; then
+        info "connected clients:"
+        awk -F, '/^CLIENT_LIST/ {print "  " $2 "  vpn=" $4 "  from " $3}' data/status.log 2>/dev/null \
+            || sed -n '/CLIENT_LIST/p' data/status.log
+    fi
+}
+
+cmd_check() {
+    info "pre-flight checks"
+
+    [[ -e /dev/net/tun ]] && ok "/dev/net/tun available" || bad "/dev/net/tun missing (modprobe tun)"
+
+    local listen
+    listen="$(ss -ltnH "sport = :$BURP_PORT" 2>/dev/null | awk '{print $4}' | paste -sd' ')"
+    if [[ -z "$listen" ]]; then
+        bad "nothing listening on host:$BURP_PORT -> start Burp"
+    elif grep -qE "(^| )(0\.0\.0\.0|\*|\[?::\]?|$GW):$BURP_PORT" <<<"$listen"; then
+        ok "Burp listening on $listen"
+    else
+        bad "Burp is only listening on $listen; the container cannot reach it. Bind to $GW:$BURP_PORT (or 0.0.0.0)"
+    fi
+
+    local st; st="$(state)"
+    if [[ "$st" == running ]]; then
+        ok "ovpn-burp container running (restarts: $(restarts))"
+        "${DC[@]}" exec -T ovpn-burp test -e /dev/net/tun \
+            && ok "/dev/net/tun visible inside the container" \
+            || bad "the container cannot see /dev/net/tun (check 'devices' in the compose file)"
+        if "${DC[@]}" exec -T ovpn-burp bash -c "timeout 3 bash -c '</dev/tcp/$BURP_TARGET/$BURP_PORT'" 2>/dev/null; then
+            ok "container reaches Burp at $BURP_TARGET:$BURP_PORT"
+        else
+            bad "the container does NOT reach $BURP_TARGET:$BURP_PORT (Burp's bind address, or a host firewall on the docker interface)"
+        fi
+        has_tun0 && ok "tun0 created in the container" \
+                 || bad "tun0 does not exist -> ./vpnburp logs"
+    elif [[ "$st" == restarting ]]; then
+        bad "container in a restart loop ($(restarts) restarts) -> ./vpnburp logs"
+    elif [[ "$st" == absent ]]; then
+        warn "container not created -> ./vpnburp up"
+    else
+        bad "container in state '$st' -> ./vpnburp logs"
+    fi
+
+    local ip; ip="$(lan_ip)"
+    ok "the device must connect to ${ip:-?}:$VPN_PORT/$VPN_PROTO (same WiFi, no client isolation on the AP)"
+}
+
+# Toggles ONLY the DNAT to Burp, leaving the VPN up. Useful to tell whether an
+# app failure comes from the proxy or from the tunnel itself.
+cmd_intercept() {
+    local mode="${1:-}"
+    case "$mode" in
+        off)
+            "${DC[@]}" exec -T ovpn-burp iptables -t nat -F PREROUTING
+            ok "DNAT disabled: the VPN stays up and traffic goes straight out, bypassing Burp"
+            ;;
+        on)
+            "${DC[@]}" exec -T ovpn-burp /usr/local/bin/entrypoint.sh nat
+            ;;
+        *) echo "usage: ./vpnburp intercept on|off" ;;
+    esac
+}
+
+# What the client ACTUALLY contacts, seen on tun0: the names it resolves and the
+# connections it opens. Includes what never reaches Burp (failed handshakes,
+# hardcoded IPs, ports you are not redirecting).
+cmd_sniff() {
+    local mode="${1:-all}" filt
+    case "$mode" in
+        dns) filt='udp port 53' ;;
+        syn) filt='tcp[tcpflags] & (tcp-syn|tcp-ack) == tcp-syn' ;;
+        all) filt='udp port 53 or (tcp[tcpflags] & (tcp-syn|tcp-ack) == tcp-syn)' ;;
+        *)   echo "usage: ./vpnburp sniff [dns|syn|all]"; return 1 ;;
+    esac
+    info "listening on tun0 ($mode) - Ctrl-C to stop"
+    "${DC[@]}" exec ovpn-burp tcpdump -i tun0 -nn -l -p -s 0 "$filt"
+}
+
+cmd_serve() {
+    local ip; ip="$(lan_ip)"
+    local port="${1:-8000}"
+    [[ -f "data/clients/$CLIENT_NAME.ovpn" ]] || { bad "no profile found: the VPN never started. Check ./vpnburp logs"; exit 1; }
+    info "http://$ip:$port/$CLIENT_NAME.ovpn   (Ctrl-C to stop)"
+    command -v qrencode >/dev/null && qrencode -t ANSIUTF8 "http://$ip:$port/$CLIENT_NAME.ovpn" || true
+    python3 -m http.server "$port" --bind "$ip" --directory data/clients
+}
+
+case "${1:-help}" in
+    up)     shift; cmd_up "$@" ;;
+    down)   shift; cmd_down "$@" ;;
+    logs)   shift; cmd_logs "$@" ;;
+    status) shift; cmd_status "$@" ;;
+    check)  shift; cmd_check "$@" ;;
+    client) shift; cmd_client "$@" ;;
+    rules)  shift; cmd_rules "$@" ;;
+    intercept) shift; cmd_intercept "$@" ;;
+    sniff)  shift; cmd_sniff "$@" ;;
+    shell)  shift; cmd_shell "$@" ;;
+    serve)  shift; cmd_serve "$@" ;;
+    *) cat <<EOF
+usage: ./vpnburp <command>
+
+  up               build and start the VPN, regenerate the .ovpn with the current LAN IP
+  down             stop and remove the container (the PKI is kept in ./data)
+  check            diagnostics: tun, Burp reachable, tun0, IP to connect to
+  status           container state and connected VPN clients
+  logs             live OpenVPN logs
+  serve [port]     serve the .ovpn over HTTP (+QR) to download it from the device
+  client <name>    generate an extra .ovpn profile
+  rules            show the active iptables rules inside the container
+  intercept on|off toggle only the DNAT to Burp, without touching the VPN
+  sniff [dns|syn]  what the client resolves and which connections it opens on tun0
+  shell            shell inside the container
+EOF
+    ;;
+esac
