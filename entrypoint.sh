@@ -30,7 +30,14 @@ trap 'rc=$?; printf "\033[1;31m[ovpn-burp] ERROR:\033[0m failed (rc=%s) at line 
 : "${MTU:=1400}"
 : "${MSSFIX:=1360}"
 : "${DATA:=/data}"
+# Comma-separated domains that public DNS can't resolve (e.g. internal .loc) and
+# that reach Burp's upstream proxy. dnsmasq answers them with DUMMY_IP so the app
+# fires the SYN and the DNAT catches it; Burp forwards by Host/SNI, so the IP is
+# irrelevant. Empty = disabled (classic behaviour: push VPN_DNS directly).
+: "${INTERNAL_DOMAINS:=}"
+: "${DUMMY_IP:=198.51.100.1}"  # any VPN-routed IP; only needs to trigger the DNAT
 
+VPN_GW="${VPN_NET%.*}.1"        # server tun0 address (= local DNS when enabled)
 PKI="$DATA/pki"
 TC_KEY="$DATA/tc.key"
 CONF="$DATA/server.conf"
@@ -110,7 +117,11 @@ port $VPN_PORT
 topology subnet
 server $VPN_NET $VPN_MASK
 push "redirect-gateway def1 bypass-dhcp"
-$(for d in ${VPN_DNS//,/ }; do echo "push \"dhcp-option DNS $d\""; done)
+$(if [[ -n "$INTERNAL_DOMAINS" ]]; then
+      echo "push \"dhcp-option DNS $VPN_GW\""
+  else
+      for d in ${VPN_DNS//,/ }; do echo "push \"dhcp-option DNS $d\""; done
+  fi)
 ca $PKI/ca.crt
 cert $PKI/issued/server.crt
 key $PKI/private/server.key
@@ -129,6 +140,21 @@ status $DATA/status.log
 verb 3
 EOF
     [[ "$VPN_PROTO" == "udp" ]] && echo "explicit-exit-notify 1" >> "$CONF"
+}
+
+# Local resolver on tun0: answers INTERNAL_DOMAINS with DUMMY_IP and forwards the
+# rest to VPN_DNS. bind-dynamic lets it attach to tun0 once OpenVPN creates it.
+write_dnsmasq_conf() {
+    {
+        echo "interface=tun0"
+        echo "bind-dynamic"
+        echo "no-resolv"
+        echo "no-hosts"
+        echo "log-queries"
+        local d
+        for d in ${INTERNAL_DOMAINS//,/ }; do echo "address=/$d/$DUMMY_IP"; done
+        for d in ${VPN_DNS//,/ };         do echo "server=$d";             done
+    } > "$DATA/dnsmasq.conf"
 }
 
 # -------------------------------------------------------------------- iptables
@@ -197,6 +223,12 @@ setup_nat
 if ! (exec 3<>"/dev/tcp/$BURP_HOST/$BURP_PORT") 2>/dev/null; then
     warn "nothing is listening on $BURP_HOST:$BURP_PORT"
     warn "in Burp, open a Proxy listener on $BURP_HOST:$BURP_PORT with 'Support invisible proxying' ENABLED"
+fi
+
+if [[ -n "$INTERNAL_DOMAINS" ]]; then
+    write_dnsmasq_conf
+    dnsmasq --conf-file="$DATA/dnsmasq.conf"
+    log "dnsmasq up on $VPN_GW:53 -> internal [$INTERNAL_DOMAINS] => $DUMMY_IP, rest via $VPN_DNS"
 fi
 
 log "starting OpenVPN on $VPN_PROTO/$VPN_PORT (network $VPN_CIDR)"

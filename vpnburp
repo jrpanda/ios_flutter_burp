@@ -25,14 +25,31 @@ set -a; . ./.env; set +a
 GW=172.28.0.1                     # bridge gateway = the host, as seen from the container
 BURP_TARGET="${BURP_HOST:-$GW}"
 
-lan_ip() { ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") {print $(i+1); exit}}'; }
+# LAN IP = IPv4 of a physical interface (wifi/ethernet), NOT of whatever owns the
+# default route: a host VPN (tun0, wg0...) would otherwise win and the phone
+# could not reach it. Physical = has /sys/class/net/<if>/device (skips tun,
+# docker, veth, bridges, lo). Ones with a default route go first, by metric.
+# LAN_IFACE in .env forces a specific interface.
+lan_iface() {
+    if [[ -n "${LAN_IFACE:-}" ]]; then echo "$LAN_IFACE"; return; fi
+    local c
+    for c in $( { ip -4 route show default | awk '{m=0; for(i=1;i<=NF;i++){if($i=="dev")d=$(i+1); if($i=="metric")m=$(i+1)} print m, d}' | sort -n | awk '{print $2}'
+                  ls /sys/class/net; } | awk '!seen[$0]++'); do
+        [[ -e "/sys/class/net/$c/device" ]] || continue
+        ip -4 -o addr show dev "$c" scope global 2>/dev/null | grep -q . && { echo "$c"; return; }
+    done
+}
+lan_ip() {
+    local ifc; ifc="$(lan_iface)"; [[ -n "$ifc" ]] || return 0
+    ip -4 -o addr show dev "$ifc" scope global 2>/dev/null | awk '{sub("/.*","",$4); print $4; exit}'
+}
 
 sync_remote_host() {
     local ip; ip="$(lan_ip)"
     [[ -n "$ip" ]] || { warn "no LAN IP detected; using REMOTE_HOST=${REMOTE_HOST:-?} from .env"; return; }
     if [[ "${REMOTE_HOST:-}" != "$ip" ]]; then
         sed -i -E "s|^REMOTE_HOST=.*|REMOTE_HOST=$ip|" .env
-        info "REMOTE_HOST updated to $ip"
+        info "REMOTE_HOST updated to $ip ($(lan_iface))"
     fi
     REMOTE_HOST="$ip"
 }
